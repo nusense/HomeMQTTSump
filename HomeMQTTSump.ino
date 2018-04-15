@@ -5,6 +5,11 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
+
+#include <PingSerial.h>
+#include <SoftwareSerial.h> // Arduino issue: a library can't include other libs
+#include <ArduinoJson.h>
+
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
 
@@ -35,8 +40,8 @@ Adafruit_SSD1306Wemos display(OLED_RESET);
 WiFiClient*   espClient = 0;
 PubSubClient* mqttClient = 0;
 
-char pubTopic[] = "rhatcher/home/wemos/test2";
-char subTopic[] = "rhatcher/home/wemos/input2";
+char pubTopic[] = "rhatcher/home/laundry/sump";
+char subTopic[] = "rhatcher/home/laundry/sump";
 
 unsigned long lastMsgSent_ms = 0;
 const     int msgLen = 255;
@@ -53,12 +58,31 @@ unsigned long dht_time = msg_time;
 
 int nloop = 0;
 
-///NewPing sonar(D0, D5, 200);
-Ultrasonic sonar(D0, D5, 20000UL);
-int dist_cm = 0;
-float echotime;
+// Here our US-100 is connected (software serial) to pins:
+const int US100_TX = D5;
+const int US100_RX = D6;
 
-bool dhtNew = true;
+SoftwareSerial SerialUS100(US100_RX, US100_TX);
+
+PingSerial us100(SerialUS100,30,1200); // valid from 30 -1200 mm
+
+bool ping_enabled = true;
+unsigned int pingSpeed = 100; // how fequenty are we sending out a ping (ms)
+                              // 50ms would be 20x a second
+unsigned long pingTimer = 0;  // Holds the next ping time
+
+bool temp_enabled = TRUE;
+unsigned int tempSpeed = 3000;
+unsigned long tempTimer = 0;
+
+int dist_mm = 0;
+int temp_C  = 0;
+
+// Inside the brackets, 512 is the size of the pool in bytes.
+// Don't forget to change this value to match your JSON document.
+// Use arduinojson.org/assistant to compute the capacity.
+StaticJsonBuffer<512> jsonBuffer;
+
 
 //This callback routine for receiving messages
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -73,7 +97,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     display.print((char)payload[i]);
   }
   Serial.println();
-  display.display();  
+  display.display();
   delay(1000);
 }
 
@@ -103,24 +127,11 @@ void mqttReconnect() {
 
 void read_ping() {
 
-  // Reading 
+  // Reading
   bool isDHTTime = (TimeLap(dht_time)>0);
   if ( ! isDHTTime ) return;
   dht_time += 4000; // wait 4000ms until next reading
 
-  int iterations = 5;
-  int max_cm_distance = 200;
-  //echotime = sonar.ping_median(iterations,max_cm_distance);
-  //cm = sonar.convert_cm(echotime);
-  dist_cm = sonar.distanceRead();
-
-  Serial.println("==========================================");
-  Serial.print("distance cm: ");
-  Serial.print(dist_cm);
-  Serial.print(" %\t");
-  Serial.print("ms: ");
-  Serial.print(echotime);
-  Serial.println("");
 }
 
 // send an NTP request to the time server at the given address
@@ -180,9 +191,9 @@ void setup() {
   digitalWrite(BUILTIN_LED, HIGH);
 
   WiFi.mode(WIFI_STA);
-  WiFi.hostname("SumpPumpMon1");  // setHostname() for ESP32, hostname() for ESP8266
+//  WiFi.hostname("SumpMon1");  // setHostname() for ESP32, hostname() for ESP8266
   // /Users/rhatcher/Library/Arduino15/packages/esp8266//hardware/esp8266/2.4.1/libraries//ESP8266WiFi/src/ESP8266WiFiSTA.h
-  
+
   //WiFi.setAutoReconnect(true); ... apparently .. .no
   WiFi.begin(ssid, password);
   Serial.print("WiFi.begin on ");
@@ -200,7 +211,7 @@ void setup() {
   // ArduinoOTA.setPort(8266);
 
   // Hostname defaults to esp8266-[ChipID]
-  ArduinoOTA.setHostname("esp8266-test2");
+  ArduinoOTA.setHostname("LaundrySumpMon-OTA");
 
   // No authentication by default
   // ArduinoOTA.setPassword((const char *)"123");
@@ -238,13 +249,17 @@ void setup() {
   mqttClient->setServer(mqtt_server,1883);
   mqttClient->setCallback(mqttCallback);
 
-  // udp for NTP 
+  // udp for NTP
   udp.begin(localPort);
-  
+
   delay(10000);
 }
 
 void loop() {
+
+  byte ping_data_available;
+  byte ping_msg;
+
   if ( mqttClient ) { // RWH
   ArduinoOTA.handle();
 
@@ -254,33 +269,11 @@ void loop() {
   mqttClient->loop();  // look for messages we subscribed to
   }
 
-  read_ping();
+  jsonBuffer.clear();
+  JsonObject& jsonRoot = jsonBuffer.createObject();
 
-  bool isMsgTime = (TimeLap(msg_time)>0);
-  bool newMsg    = ( dhtNew == true ); //( strcmp(currMsg,prevMsg) != 0 || dhtNew == true );
-
-  // fake message
-  if ( isMsgTime || newMsg ) {
-    nloop++;
-    dhtNew = false;
-  //    snprintf(currMsg,sizeof(currMsg),"{ nloop: \"%d\", degF: \"%f\", hum: \"%f\", heatIndex: \"%f\" }",
-  //  nloop,f,h,hif);
-     char* p = currMsg;
-     char* pend = currMsg + msgLen;
-     snprintf(p,pend-p,"{ \"distcm\": \"");
-     p += 13;
-     dtostrf((double)dist_cm,6,2,p);
-     p += 6;
-     //snprintf(p,pend-p,"\", ms: \"");
-     //p += 14;
-     //dtostrf(echotime,6,2,p);
-     //p += 6;
-     snprintf(p,pend-p,"\" }");
-     p += 3;
-     *p = 0;
-     ++p;
-  //  }
-
+/*
+  if ( false ) {
   // has it been long enough since last, or is message new?
   //if ( isMsgTime || newMsg ) {
     msg_time += MSG_INTERVAL;
@@ -331,20 +324,64 @@ void loop() {
         Serial.print('0');
       }
       Serial.println(epoch % 60); // print the second
-      
-    }
 
+    }
+*/
     // blink on
     digitalWrite(BUILTIN_LED, LOW);
 
+
+    static uint16_t last_dist_mm = 0;
+    static int      last_temp_C  = 0;
+
+    ping_data_available = us100.data_available();
+
+    if (ping_data_available & DISTANCE) {
+      Serial.print("Distance: ");
+      last_dist_mm = us100.get_distance();
+      Serial.println(last_dist_mm);
+      JsonArray& distValues = jsonRoot.createNestedArray("distance");
+      distValues.add(last_dist_mm);
+      distValues.add("mm");
+    }
+    if (ping_data_available & TEMPERATURE) {
+      Serial.print("Temperature: ");
+      last_temp_C = us100.get_temperature();
+      Serial.println(last_temp_C);
+      JsonArray& tempValues = jsonRoot.createNestedArray("temperature");
+      tempValues.add(last_temp_C);
+      tempValues.add("*C");
+    }
+
+    if ( ping_data_available ) {
+      //root.printTo(Serial);
+      //Serial.println();
+      jsonRoot.prettyPrintTo(Serial);
+      Serial.println();
+    }
+
+    if (ping_enabled && (millis() >= pingTimer)) {
+      // pingSpeed milliseconds since last ping, do another ping.
+      pingTimer = millis() + pingSpeed;      // Set the next ping time.
+      us100.request_distance();
+      //Serial.println("Distance requested");
+    }
+
+    if (temp_enabled && (millis() >= tempTimer)) {
+      tempTimer = millis() + tempSpeed;
+      us100.request_temperature();
+      //Serial.println("Temperature requested");
+    }
+
+    
     Serial.print("Publish message: ");  // Send a message to serial window for debugging.
     Serial.println(currMsg);
     if ( mqttClient) {
       Serial.print("call publish to ");
       Serial.print(pubTopic);
       mqttClient->publish(pubTopic, currMsg);
-    }
-    
+  /*  } */
+
     // start at the top
     display.clearDisplay();
     display.setCursor(0,0);
@@ -358,4 +395,3 @@ void loop() {
   }
 
 }
-

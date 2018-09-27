@@ -17,10 +17,9 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306Wemos.h>
-// Wemos OLED Display Shield uses pins D2, D1, D5
 
 // Replace with your network credentials
-//#define AT_HOME 1
+#define AT_HOME 1
 
 #include "Secrets.h"
 
@@ -40,13 +39,21 @@ Adafruit_SSD1306Wemos display(OLED_RESET);
 WiFiClient*   espClient = 0;
 PubSubClient* mqttClient = 0;
 
-char pubTopic[] = "rhatcher/home/laundry/sump";
-char subTopic[] = "rhatcher/home/laundry/sump";
+char pubTopic[] = "rhatcher/home/storage/sump/data";
+char subTopic[] = "rhatcher/home/storage/sump/commands";
 
 unsigned long lastMsgSent_ms = 0;
-const     int msgLen = 255;
+const     int msgLen = 512;
 char          prevMsg[msgLen] = "prevMsg";
 char          currMsg[msgLen];
+uint16_t      sameCountMax = 200;
+
+
+// Inside the brackets, 512 is the size of the pool in bytes.
+// Don't forget to change this value to match your JSON document.
+// Use arduinojson.org/assistant to compute the capacity.
+StaticJsonBuffer<msgLen> jsonBuffer;
+
 
 // Synchronization loop for long intervals (more than 32 seconds)
 #define TimeLap(t1) (long)((unsigned long)millis()-(unsigned long)t1)
@@ -58,30 +65,44 @@ unsigned long dht_time = msg_time;
 
 int nloop = 0;
 
+// serial data, serial clock, 
+// SCK=serial clock for SPI
+// SCL=serial clock for I2C
+// Wemos OLED Display Shield uses pins SDA=D2, SCL=D1
+// (online says only D1&D2, shane's doc says also SCK=D5)
+// built_in LED = D4
+
 // Here our US-100 is connected (software serial) to pins:
-const int US100_TX = D5;
-const int US100_RX = D6;
+const int US100_TX = D7;  // blue   was D6 for laundry, D7 for storage
+const int US100_RX = D6;  // white  was d7 for laundry, D6 for storage
+// don't use D8 for some reason ... breaks upload
+
+int Enabled = 1;
+int InAlarm = 0;
+const int EnabledPin = D3;
+const int InAlarmPin = D4;
+
+int AlarmDist = 300; //mm
+
 
 SoftwareSerial SerialUS100(US100_RX, US100_TX);
 
-PingSerial us100(SerialUS100,30,1200); // valid from 30 -1200 mm
+const int distMin = 30;
+const int distMax = 1200;
+PingSerial us100(SerialUS100,distMin,distMax); // valid from 30 -1200 mm
 
 bool ping_enabled = true;
-unsigned int pingSpeed = 100; // how fequenty are we sending out a ping (ms)
+unsigned int pingSpeed = 200; // how frequently are we sending out a ping (ms)
                               // 50ms would be 20x a second
 unsigned long pingTimer = 0;  // Holds the next ping time
 
-bool temp_enabled = TRUE;
+bool temp_enabled = true;
 unsigned int tempSpeed = 3000;
 unsigned long tempTimer = 0;
 
-int dist_mm = 0;
-int temp_C  = 0;
+//int dist_mm = 0;
+//int temp_C  = 0;
 
-// Inside the brackets, 512 is the size of the pool in bytes.
-// Don't forget to change this value to match your JSON document.
-// Use arduinojson.org/assistant to compute the capacity.
-StaticJsonBuffer<512> jsonBuffer;
 
 
 //This callback routine for receiving messages
@@ -89,6 +110,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.print("Message arrived [");
   Serial.print(topic);
   Serial.print("] ");
+  /*
+  Serial.println("mqttCallback clearDisplay");
   display.clearDisplay();
   // 6x8 pixel characters ... last line
   display.setCursor(0,40);
@@ -99,6 +122,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.println();
   display.display();
   delay(1000);
+  */
 }
 
 void mqttReconnect() {
@@ -108,7 +132,8 @@ void mqttReconnect() {
     Serial.print("Attempting MQTT connection...");
     // Create a random client ID
     String clientId = "ESP8266Client-";
-    clientId += String(random(0xffff), HEX);  // I do not think this is necessary. Is the client ID important?
+    clientId += String(random(0xffff), HEX);  
+    // I do not think this is necessary. Is the client ID important?
     // Attempt to connect
     if ( mqttClient->connect(clientId.c_str(),mqtt_user,mqtt_pass) ) {
       // This is the major change to make this sketch work. Added username, mqttpass
@@ -123,15 +148,6 @@ void mqttReconnect() {
       delay(1000);
     }
   }
-}
-
-void read_ping() {
-
-  // Reading
-  bool isDHTTime = (TimeLap(dht_time)>0);
-  if ( ! isDHTTime ) return;
-  dht_time += 4000; // wait 4000ms until next reading
-
 }
 
 // send an NTP request to the time server at the given address
@@ -181,7 +197,7 @@ void setup() {
   Serial.println(String(ESP.getFreeHeap()));
 
   // 68 pixel characters
-  display.setCursor(0,16);
+  display.setCursor(0,8);
   display.print("heap:");
   display.println(String(ESP.getFreeHeap()));
   display.display();
@@ -190,9 +206,16 @@ void setup() {
   pinMode(BUILTIN_LED, OUTPUT);     // Initialize the BUILTIN_LED pin as an output
   digitalWrite(BUILTIN_LED, HIGH);
 
+  pinMode(EnabledPin, OUTPUT);
+  digitalWrite(EnabledPin, 0);
+  pinMode(InAlarmPin, OUTPUT);
+  digitalWrite(InAlarmPin, 0);
+
+
   WiFi.mode(WIFI_STA);
 //  WiFi.hostname("SumpMon1");  // setHostname() for ESP32, hostname() for ESP8266
-  // /Users/rhatcher/Library/Arduino15/packages/esp8266//hardware/esp8266/2.4.1/libraries//ESP8266WiFi/src/ESP8266WiFiSTA.h
+  // /Users/rhatcher/Library/Arduino15/packages/esp8266//hardware/esp8266/2.4.1/libraries/
+  //        //ESP8266WiFi/src/ESP8266WiFiSTA.h
 
   //WiFi.setAutoReconnect(true); ... apparently .. .no
   WiFi.begin(ssid, password);
@@ -211,7 +234,7 @@ void setup() {
   // ArduinoOTA.setPort(8266);
 
   // Hostname defaults to esp8266-[ChipID]
-  ArduinoOTA.setHostname("LaundrySumpMon-OTA");
+  //ArduinoOTA.setHostname("LaundrySumpMon-OTA");
 
   // No authentication by default
   // ArduinoOTA.setPassword((const char *)"123");
@@ -239,7 +262,7 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   // 68 pixel characters
-  display.setCursor(0,8);
+  display.setCursor(0,16);
   display.println(WiFi.localIP());
   display.display();
 
@@ -252,28 +275,16 @@ void setup() {
   // udp for NTP
   udp.begin(localPort);
 
-  delay(10000);
+  // do this _after_ wifi init ... LED drain interferes w/ wifi setup
+  digitalWrite(EnabledPin, Enabled);
+  digitalWrite(InAlarmPin, InAlarm);
+
+  delay(5000);
 }
 
-void loop() {
+void fillJsonTime(JsonObject& jsonRoot) {
 
-  byte ping_data_available;
-  byte ping_msg;
-
-  if ( mqttClient ) { // RWH
-  ArduinoOTA.handle();
-
-  if ( ! mqttClient->connected() ) {
-    mqttReconnect();
-  }
-  mqttClient->loop();  // look for messages we subscribed to
-  }
-
-  jsonBuffer.clear();
-  JsonObject& jsonRoot = jsonBuffer.createObject();
-
-/*
-  if ( false ) {
+  /*
   // has it been long enough since last, or is message new?
   //if ( isMsgTime || newMsg ) {
     msg_time += MSG_INTERVAL;
@@ -327,71 +338,166 @@ void loop() {
 
     }
 */
-    // blink on
-    digitalWrite(BUILTIN_LED, LOW);
 
+}
 
-    static uint16_t last_dist_mm = 0;
-    static int      last_temp_C  = 0;
+byte fillJsonUS100(JsonObject& jsonRoot) {
 
-    ping_data_available = us100.data_available();
+  byte ping_data_available;
+  byte ping_msg;
 
-    if (ping_data_available & DISTANCE) {
-      Serial.print("Distance: ");
-      last_dist_mm = us100.get_distance();
-      Serial.println(last_dist_mm);
-      JsonArray& distValues = jsonRoot.createNestedArray("distance");
-      distValues.add(last_dist_mm);
-      distValues.add("mm");
+  static uint16_t last_dist_mm = 0;
+  static uint16_t this_dist_mm = 0;
+  static int      last_temp_C  = 0;
+  static int      this_temp_C  = 0;
+  
+  byte            samedata     = 0;
+  static uint16_t sameCount    = 0;
+
+  ping_data_available = us100.data_available();
+
+  if (ping_data_available & DISTANCE) {
+    //Serial.print("Distance: ");
+    last_dist_mm = this_dist_mm;
+    this_dist_mm = us100.get_distance();
+    if (this_dist_mm > distMax) this_dist_mm = distMax + 1;
+    if (this_dist_mm < distMin) this_dist_mm = distMin - 1;
+    if (last_dist_mm == this_dist_mm) samedata = samedata | DISTANCE;
+    //Serial.println(last_dist_mm);
+    JsonArray& distValues = jsonRoot.createNestedArray("distance");
+    distValues.add(this_dist_mm);
+    distValues.add("mm");
+  }
+
+#ifdef DOTEMP
+  if (ping_data_available & TEMPERATURE) {
+    //Serial.print("Temperature: ");
+    last_temp_C = this_temp_C;
+    this_temp_C = us100.get_temperature();
+    if (last_temp_C == this_temp_C) samedata = samedata | TEMPERATURE;
+    //Serial.println(last_temp_C);
+    JsonArray& tempValues = jsonRoot.createNestedArray("temperature");
+    tempValues.add(this_temp_C);
+    tempValues.add("*C");
+  }
+#endif
+
+  if ( ping_data_available ) {
+    //root.printTo(Serial);
+    //Serial.println();
+    //    jsonRoot.prettyPrintTo(Serial);
+    //Serial.println();
+  }
+
+  if (ping_enabled && (millis() >= pingTimer)) {
+    // pingSpeed milliseconds since last ping, do another ping.
+    pingTimer = millis() + pingSpeed;      // Set the next ping time.
+    us100.request_distance();
+    //Serial.println("Distance requested");
+  }
+
+#ifdef DOTEMP
+  if (temp_enabled && (millis() >= tempTimer)) {
+    tempTimer = millis() + tempSpeed;
+    us100.request_temperature();
+    //Serial.println("Temperature requested");
+  }
+#endif
+
+  if ( ping_data_available != 0 ) {
+    if ( ping_data_available == samedata ) {
+      ++sameCount;  
+      if (sameCount < sameCountMax) {
+        ping_data_available = 0;
+        Serial.print("sameCount ");
+        Serial.println(sameCount);
+      } else {
+        sameCount = 0;
+      }
+    } else {
+      sameCount = 0;
     }
-    if (ping_data_available & TEMPERATURE) {
-      Serial.print("Temperature: ");
-      last_temp_C = us100.get_temperature();
-      Serial.println(last_temp_C);
-      JsonArray& tempValues = jsonRoot.createNestedArray("temperature");
-      tempValues.add(last_temp_C);
-      tempValues.add("*C");
-    }
+      //Serial.println(last_dist_mm);
+      //Serial.println(this_dist_mm);
+#ifdef DOTEMP
+      //Serial.println(last_temp_C);
+      //Serial.println(this_temp_C);
+#endif
+  }
 
-    if ( ping_data_available ) {
-      //root.printTo(Serial);
-      //Serial.println();
-      jsonRoot.prettyPrintTo(Serial);
-      Serial.println();
-    }
+  return ping_data_available;
+}
 
-    if (ping_enabled && (millis() >= pingTimer)) {
-      // pingSpeed milliseconds since last ping, do another ping.
-      pingTimer = millis() + pingSpeed;      // Set the next ping time.
-      us100.request_distance();
-      //Serial.println("Distance requested");
-    }
-
-    if (temp_enabled && (millis() >= tempTimer)) {
-      tempTimer = millis() + tempSpeed;
-      us100.request_temperature();
-      //Serial.println("Temperature requested");
-    }
-
-    
-    Serial.print("Publish message: ");  // Send a message to serial window for debugging.
-    Serial.println(currMsg);
-    if ( mqttClient) {
-      Serial.print("call publish to ");
-      Serial.print(pubTopic);
-      mqttClient->publish(pubTopic, currMsg);
-  /*  } */
-
+void displayJson(JsonObject& jsonRoot) {
     // start at the top
+    Serial.println("displayJson clearDisplay");
     display.clearDisplay();
     display.setCursor(0,0);
 
-    display.println(currMsg);
+    //display.println(currMsg);
+    JsonArray& distarray = jsonRoot["distance"];
+    display.print(distarray.get<int>(0));
+    display.println(" mm");
+    display.print("Enabled ");
+    display.println(Enabled);
+    display.print("Alert ");
+    display.print(InAlarm);
     display.display();
 
-    delay(100);
-    digitalWrite(BUILTIN_LED, HIGH);
+}
+
+
+void publishJson(JsonObject& jsonRoot) {
+
+  jsonRoot.prettyPrintTo(currMsg,msgLen);
+  Serial.print("Publish message: ");  // Send a message to serial window for debugging.
+  Serial.println(currMsg);
+  if ( mqttClient) {
+    Serial.print("call publish to ");
+    Serial.println(pubTopic);
+    mqttClient->publish(pubTopic, currMsg);
+  }
+  strcpy(prevMsg,currMsg);
+}
+
+void loop() {
+
+  if ( mqttClient ) { // RWH
+    ArduinoOTA.handle();
+
+    if ( ! mqttClient->connected() ) {
+      mqttReconnect();
+    }
+    mqttClient->loop();  // look for messages we subscribed to
+  }
+
+  // blink on
+  digitalWrite(BUILTIN_LED, LOW);
+
+  jsonBuffer.clear();
+  JsonObject& jsonRoot = jsonBuffer.createObject();
+
+  fillJsonTime(jsonRoot);
+
+  byte new_ping_data = fillJsonUS100(jsonRoot);
+  if ( new_ping_data ) {
+
+    displayJson(jsonRoot);
+
+    publishJson(jsonRoot);
+
+  // @@@ should check whether "distance" exists first!!!
+  // this is probably source of 0's and alarm flicker
+    if (jsonRoot["distance"][0] < AlarmDist ) {
+      InAlarm = 1;
+    } else {
+      InAlarm = 0;
+    }
+    digitalWrite(InAlarmPin,InAlarm);
 
   }
+
+  //delay(100);
+  digitalWrite(BUILTIN_LED, HIGH);
 
 }
